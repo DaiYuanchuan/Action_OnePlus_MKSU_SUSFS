@@ -57,10 +57,10 @@ jobs:
           root-reserve-mb: 8192
           temp-reserve-mb: 2048
           swap-size-mb: 8192
-          remove-dotnet: 'true'
-          remove-android: 'true'
-          remove-haskell: 'true'
-          remove-codeql: 'true'
+          remove-dotnet: "true"
+          remove-android: "true"
+          remove-haskell: "true"
+          remove-codeql: "true"
 
       - name: Configure Git
         run: |
@@ -70,7 +70,20 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt update
-          sudo apt install -y python3 git curl jq bc bison flex libssl-dev libelf-dev
+          sudo apt install -y \
+            python3 \
+            git \
+            curl \
+            jq \
+            bc \
+            bison \
+            flex \
+            libssl-dev \
+            libelf-dev \
+            build-essential \
+            rsync \
+            unzip \
+            zip
 
       - name: Show selected inputs
         run: |
@@ -89,7 +102,7 @@ jobs:
 
       - name: Initialize repo and sync
         run: |
-          mkdir kernel_workspace
+          mkdir -p kernel_workspace
           cd kernel_workspace
 
           repo init \
@@ -198,7 +211,7 @@ jobs:
             # Base SukiSU only
             set_config_y "$file" "CONFIG_KSU"
 
-            # GKI should use KPROBES hook, not manual hook
+            # GKI mode should use KPROBES hook, not manual hook
             set_config_y "$file" "CONFIG_KPROBES"
             set_config_n "$file" "CONFIG_KSU_MANUAL_HOOK"
 
@@ -210,7 +223,7 @@ jobs:
             echo "# CONFIG_KSU_SUSFS is not set" >> "$file"
           done
 
-          # Remove check_defconfig, otherwise appended configs may fail strict checking
+          # Avoid strict defconfig check failures caused by appended config
           sed -i 's/check_defconfig//' ./common/build.config.gki || true
 
           echo "===== gki_defconfig KSU/KPM/SUSFS summary ====="
@@ -221,10 +234,11 @@ jobs:
             grep -nE "CONFIG_KSU|CONFIG_KPM|CONFIG_KPROBES" "$OPLUS_GKI_CONFIG" || true
           fi
 
-      - name: Build kernel
+      - name: Build kernel with bazel
         if: ${{ github.event.inputs.CPU == 'sm8650' || github.event.inputs.CPU == 'sm7675' }}
         run: |
           cd kernel_workspace
+
           ./kernel_platform/build_with_bazel.py \
             -t ${{ github.event.inputs.CPUD }} \
             ${{ github.event.inputs.BUILD_METHOD }}
@@ -246,18 +260,27 @@ jobs:
         run: |
           cd "$GITHUB_WORKSPACE"
 
-          echo "===== Find Image outputs ====="
-          find kernel_workspace/kernel_platform -type f -name "Image" -print || true
+          echo "===== Current workspace ====="
+          pwd
+          ls -lah
 
-          echo "===== Find boot-related outputs ====="
-          find kernel_workspace/kernel_platform -type f \( \
+          echo "===== kernel_platform top level ====="
+          ls -lah kernel_workspace/kernel_platform || true
+
+          echo "===== Find Image-like outputs ====="
+          find kernel_workspace -type f \( \
             -name "Image" -o \
-            -name "boot.img" -o \
-            -name "vendor_boot.img" -o \
-            -name "dtbo.img" -o \
-            -name "system_dlkm*.img" -o \
-            -name "vendor_dlkm*.img" \
-          \) -print || true
+            -name "Image.gz" -o \
+            -name "Image.lz4" -o \
+            -name "vmlinux" -o \
+            -name "boot.img" \
+          \) -print -exec ls -lh {} \; || true
+
+          echo "===== Find dist directories ====="
+          find kernel_workspace -type d -name "dist" -print || true
+
+          echo "===== List possible out files ====="
+          find kernel_workspace/kernel_platform/out -maxdepth 8 -type f 2>/dev/null | head -n 500 || true
 
       - name: Make AnyKernel3
         run: |
@@ -266,34 +289,51 @@ jobs:
           git clone https://github.com/Numbersf/AnyKernel3 --depth=1
           rm -rf ./AnyKernel3/.git
 
-          dir1="kernel_workspace/kernel_platform/out/msm-kernel-${{ github.event.inputs.CPUD }}-${{ github.event.inputs.BUILD_METHOD }}/dist/"
-          dir2="kernel_workspace/kernel_platform/bazel-out/k8-fastbuild/bin/msm-kernel/${{ github.event.inputs.CPUD }}_gki_kbuild_mixed_tree/"
-          dir3="kernel_workspace/kernel_platform/out/msm-${{ github.event.inputs.CPUD }}-${{ github.event.inputs.CPUD }}-${{ github.event.inputs.BUILD_METHOD }}/dist/"
-          dir4="kernel_workspace/kernel_platform/out/msm-kernel-${{ github.event.inputs.CPUD }}-${{ github.event.inputs.BUILD_METHOD }}/gki_kernel/common/arch/arm64/boot/"
-          dir5="kernel_workspace/kernel_platform/out/msm-${{ github.event.inputs.CPUD }}-${{ github.event.inputs.CPUD }}-${{ github.event.inputs.BUILD_METHOD }}/gki_kernel/common/arch/arm64/boot/"
+          echo "===== Searching Image ====="
 
           image_path=""
 
-          if [ -f "${dir1}Image" ]; then
-            image_path="${dir1}Image"
-          elif [ -f "${dir2}Image" ]; then
-            image_path="${dir2}Image"
-          elif [ -f "${dir3}Image" ]; then
-            image_path="${dir3}Image"
-          elif [ -f "${dir4}Image" ]; then
-            image_path="${dir4}Image"
-          elif [ -f "${dir5}Image" ]; then
-            image_path="${dir5}Image"
-          else
-            image_path=$(find "./kernel_workspace/kernel_platform" -type f -name "Image" | head -n 1 || true)
+          # 1. Prefer dist Image
+          image_path="$(find kernel_workspace -type f -path "*/dist/Image" | head -n 1 || true)"
+
+          # 2. Then arm64 boot Image
+          if [ -z "$image_path" ]; then
+            image_path="$(find kernel_workspace -type f -path "*/arch/arm64/boot/Image" | head -n 1 || true)"
           fi
+
+          # 3. Then Image under kernel_platform/out
+          if [ -z "$image_path" ]; then
+            image_path="$(find kernel_workspace/kernel_platform/out -type f -name "Image" 2>/dev/null | head -n 1 || true)"
+          fi
+
+          # 4. Then Image under kernel_platform
+          if [ -z "$image_path" ]; then
+            image_path="$(find kernel_workspace/kernel_platform -type f -name "Image" 2>/dev/null | head -n 1 || true)"
+          fi
+
+          # 5. Then Image under whole kernel_workspace
+          if [ -z "$image_path" ]; then
+            image_path="$(find kernel_workspace -type f -name "Image" 2>/dev/null | head -n 1 || true)"
+          fi
+
+          echo "image_path=$image_path"
 
           if [ -z "$image_path" ] || [ ! -f "$image_path" ]; then
             echo "ERROR: Image not found"
+            echo "===== Debug: all Image-like files ====="
+            find kernel_workspace -type f \( \
+              -name "Image" -o \
+              -name "Image.gz" -o \
+              -name "Image.lz4" -o \
+              -name "vmlinux" -o \
+              -name "boot.img" \
+            \) -print -exec ls -lh {} \; || true
             exit 1
           fi
 
           echo "Using Image: $image_path"
+          ls -lh "$image_path"
+
           cp "$image_path" ./AnyKernel3/Image
 
           echo "===== AnyKernel3 content ====="
